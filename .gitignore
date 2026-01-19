@@ -13,4 +13,6 @@ temp/
 /*.cs
 /temp*.js
 /*.log
-/*.gia
+*.gia
+
+*.js
