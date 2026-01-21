@@ -185,8 +185,8 @@ class RawIRModuleBuilder {
       if (in_deg !== 1) continue;
       const index = remove_duplicates(this.get_flows_to(node).map(f => f.to_index));
       assert(index.length === 1);
-      const selector_index = typeof index[0] === "number" ? index[0] : Number(index[0]);
-      assert(!Number.isNaN(selector_index));
+      const selector_index = index[0];
+      assert(typeof selector_index === "number" && Number.isFinite(selector_index));
       if (selector_index === 0) continue;
       // selector
       this.id2selector.set(id._id, {
