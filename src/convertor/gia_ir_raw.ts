@@ -11,9 +11,9 @@ const _srcRange = { start: 0, end: 0 } as const;
 class RawIRModuleBuilder {
   graph: Graph;
   /** Node to IR node id */
-  node2id: Map<NodeHelper<any>, IR_Node> = new Map();
+  node2id: Map<Node, IR_Node> = new Map();
   /** IR node id to Node */
-  id2node: Map<number, NodeHelper<any>> = new Map();
+  id2node: Map<number, Node> = new Map();
   /** [from ir id , to ir id] */
   flows: [number, number][] = []
   /** Map of node pin id, to [node id, branch index] */
@@ -23,6 +23,12 @@ class RawIRModuleBuilder {
 
 
   structure: null | ChainResult = null;
+  flow_edges: null | {
+    from: Node;
+    to: Node;
+    from_index: number;
+    to_index: number;
+  }[] = null;
 
   constructor(gia: Graph) {
     this.graph = gia;
@@ -50,6 +56,7 @@ class RawIRModuleBuilder {
     // Link starter/Anchor with chain.
 
 
+    const graph = this.createExecutionBlocks();
     return {
       kind: "module",
       imports: [],
@@ -59,15 +66,15 @@ class RawIRModuleBuilder {
       defines: [],
       components: [],
       lambdas: [],
-      shared_funcs: [],
-      graph: [],
+      shared_funcs: [...this.id2shared_decl.values()],
+      graph: graph,
       _id: IR_Id_Counter.value,
       _srcRange
     };
   }
   initNodes() {
     // Create IR nodes
-    for (const n of this.graph.get_nodes()) {
+    for (const n of this.get_nodes()) {
       const node = ir_node(n);
       assert(!this.node2id.has(n));
       assert(!this.id2node.has(node._id));
@@ -77,8 +84,8 @@ class RawIRModuleBuilder {
   }
   initFlows() {
     // Create flows
-    for (const n of this.graph.get_nodes()) {
-      for (const f of this.graph.get_flows_from(n)) {
+    for (const n of this.get_nodes()) {
+      for (const f of this.get_flows_from(n)) {
         const from_id = this.node2id.get(f.from)!._id;
         const to_id = this.node2id.get(f.to)!._id;
         const from_str = `${from_id}-out-${f.from_index}`;
@@ -175,7 +182,7 @@ class RawIRModuleBuilder {
       assert(id.kind === "call");
       const in_deg = this.structure!.in_deg.get(id._id)!;
       if (in_deg !== 1) continue;
-      const index = remove_duplicates(this.graph.get_flows_to(node).map(f => f.to_index));
+      const index = remove_duplicates(this.get_flows_to(node).map(f => f.to_index));
       assert(index.length === 1);
       if (index[0] === 0) continue;
       // selector
@@ -193,7 +200,7 @@ class RawIRModuleBuilder {
             pos: 0
           }, {
             type: "int",
-            value: index[0].apply.toString(),
+            value: index[0].toString(),
             pos: 0
           }],
           name: null,
@@ -224,7 +231,7 @@ class RawIRModuleBuilder {
       assert(id.kind === "call");
       const out_deg = this.structure!.out_deg.get(id._id)!;
       if (out_deg === 0) continue;
-      const index = remove_duplicates(this.graph.get_flows_from(node).map(f => f.from_index));
+      const index = remove_duplicates(this.get_flows_from(node).map(f => f.from_index));
       if (index.length === 1) {
         id.branches.push(ir_branch_jump_to(branch_name(index[0]), 0));
         continue;
@@ -328,6 +335,72 @@ class RawIRModuleBuilder {
    * - Node with branch before
    * - 
    */
+  createExecutionBlocks(): IR_ExecutionBlock[] {
+    if (this.structure === null) return [];
+    const blocks: IR_ExecutionBlock[] = [];
+    for (const [starter, chains] of this.starter_chains.entries()) {
+      if (this.structure.in_deg.get(starter) !== 0) continue;
+      if (!this.id2node.has(starter)) continue;
+      const starter_node = this.node2id.get(this.id2node.get(starter)!)!;
+      if (starter_node.kind !== "call") continue;
+      const trigger: IR_Trigger = {
+        kind: "trigger",
+        _id: IR_Id_Counter.value,
+        _srcRange,
+        node: {
+          ...starter_node,
+          class: "Sys",
+          specific: starter_node.specific ?? "Trigger",
+        }
+      };
+      blocks.push({
+        kind: "block",
+        starter: trigger,
+        chain: chains,
+        _id: IR_Id_Counter.value,
+        _srcRange,
+      });
+    }
+    return blocks;
+  }
+  get_nodes(): Node[] {
+    return Array.from(this.graph.nodes.values());
+  }
+  get_flows_from(node: Node) {
+    return this.get_flow_edges().filter(edge => edge.from === node);
+  }
+  get_flows_to(node: Node) {
+    return this.get_flow_edges().filter(edge => edge.to === node);
+  }
+  get_flow_edges() {
+    if (this.flow_edges !== null) return this.flow_edges;
+    const edges: {
+      from: Node;
+      to: Node;
+      from_index: number;
+      to_index: number;
+    }[] = [];
+    for (const flow of this.graph.flows) {
+      const from_index = this.get_flow_pin_index(flow.from, flow.from_pin.Identifier, "Out");
+      const to_index = this.get_flow_pin_index(flow.to, flow.to_pin.Identifier, "In");
+      if (from_index === null || to_index === null) continue;
+      edges.push({
+        from: flow.from,
+        to: flow.to,
+        from_index,
+        to_index,
+      });
+    }
+    this.flow_edges = edges;
+    return edges;
+  }
+  get_flow_pin_index(node: Node, pin: string, direction: "In" | "Out"): number | null {
+    const pins = (node.variant_def ?? node.def).FlowPins
+      .filter(p => p.Direction === direction && p.Visibility !== "Hidden")
+      .sort((a, b) => a.ShellIndex - b.ShellIndex);
+    const index = pins.findIndex(p => p.Identifier === pin);
+    return index >= 0 ? index : null;
+  }
 }
 
 function move_data(dest: IR_CallNode, src: IR_CallNode) {
@@ -407,24 +480,7 @@ function ir_call_shared(node: SharedFuncDecl, port: BranchId): IR_CallNode {
 
 
 function ir_node(n: Node): IR_Node {
-  const gid = n.GenericId;
-  const cid: number | string | null = n.ConcreteId;
-  if (cid === null) {
-    const node_name = helper.get_node_name_from_gid(gid);
-    const name = "_" + node_name?.replaceAll("_", "");
-    return {
-      kind: "call",
-      class: "Sys",
-      name: name,
-      inputs: [],
-      outputs: [],
-      branches: [],
-      _id: IR_Id_Counter.value,
-      _srcRange,
-    };
-  }
-  const node_name = helper.get_node_name_from_cid(cid);
-  const name = "_" + node_name?.replaceAll("_", "");
+  const name = format_node_name(n.def.Identifier);
   return {
     kind: "call",
     class: "Sys",
@@ -458,4 +514,18 @@ function nodes_to_execution_block(chains: IR_Node[]): IR_ExecutionBlock {
 
 if (import.meta.main) {
   // For test
+}
+
+function format_node_name(identifier: string): string {
+  let key = identifier.replace(/[^A-Za-z0-9.]+[A-Za-z0-9]/g, (match) => match.slice(-1).toUpperCase());
+  key = key.charAt(0).toUpperCase() + key.slice(1);
+  key = key.replace(/\./g, "_");
+  if (/^[0-9]/.test(key)) {
+    return "_" + key;
+  }
+  return key;
+}
+
+export function giaToRawIRModule(gia: Graph): IR_GraphModule {
+  return new RawIRModuleBuilder(gia).build();
 }
